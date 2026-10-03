@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Person Detector — Speed & Object vs Human</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  body { font-family:'Segoe UI',system-ui,sans-serif; background:#0b0e1a; color:#eef; min-height:100vh; }
+  header { padding:16px 20px; display:flex; align-items:center; gap:12px; flex-wrap:wrap; }
+  header h1 { font-size:20px; }
+  header h1 span { background:linear-gradient(90deg,#7CFC00,#00e5ff); -webkit-background-clip:text; -webkit-text-fill-color:transparent; }
+  header p { opacity:.65; font-size:13px; width:100%; }
+  main { display:flex; gap:16px; padding:0 20px 20px; flex-wrap:wrap; }
+  #stage { position:relative; flex:1 1 640px; min-width:300px; }
+  #view { position:relative; width:100%; aspect-ratio:4/3; background:#111; border-radius:14px; overflow:hidden; }
+  #cam, #overlay { position:absolute; inset:0; width:100%; height:100%; object-fit:cover; }
+  #overlay { pointer-events:none; }
+  #controls { margin-top:10px; display:flex; gap:10px; flex-wrap:wrap; }
+  button { padding:10px 18px; border:none; border-radius:999px; cursor:pointer; font-weight:700; font-size:14px; }
+  #startBtn { background:linear-gradient(90deg,#7CFC00,#00e5ff); color:#06210a; }
+  #stopBtn { background:#2a3350; color:#fff; }
+  button:disabled { opacity:.45; cursor:default; }
+  #status { font-size:13px; opacity:.75; align-self:center; }
+  aside { flex:1 1 300px; min-width:280px; display:flex; flex-direction:column; gap:12px; }
+  .card { background:rgba(255,255,255,.05); border:1px solid rgba(255,255,255,.08); border-radius:14px; padding:14px 16px; }
+  .card h2 { font-size:14px; margin-bottom:8px; color:#7CFC00; }
+  .card h2.orange { color:#ff9f1c; }
+  #personList, #objectList { font-size:13px; line-height:1.7; max-height:220px; overflow:auto; }
+  .pill { display:inline-block; padding:1px 8px; border-radius:999px; font-size:11px; font-weight:700; margin-right:6px; }
+  .pill.human { background:rgba(124,252,0,.18); color:#7CFC00; border:1px solid rgba(124,252,0,.4); }
+  .pill.object { background:rgba(255,159,28,.15); color:#ff9f1c; border:1px solid rgba(255,159,28,.4); }
+  .row { padding:6px 0; border-bottom:1px solid rgba(255,255,255,.06); }
+  .row:last-child { border-bottom:none; }
+  .speed { color:#00e5ff; font-weight:700; }
+  #legend { font-size:12px; opacity:.7; }
+  #note { font-size:12px; opacity:.6; line-height:1.6; }
+  #err { color:#ff6b6b; font-size:13px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🎥 <span>Person Detector</span> — speed + human vs object</h1>
+  <p>Uses your webcam + TensorFlow.js (COCO-SSD) entirely in the browser. Nothing is uploaded — all detection runs locally.</p>
+</header>
+<main>
+  <section id="stage">
+    <div id="view">
+      <video id="cam" autoplay muted playsinline></video>
+      <canvas id="overlay"></canvas>
+    </div>
+    <div id="controls">
+      <button id="startBtn">▶ Start camera & detection</button>
+      <button id="stopBtn" disabled>⏹ Stop</button>
+      <span id="status">Model not loaded yet.</span>
+    </div>
+    <div id="err"></div>
+    <p id="legend">🟩 Green box = <b>real person</b> (class “person”) &nbsp;·&nbsp; 🟧 Orange box = <b>other object</b> (chair, bottle, cell phone…)</p>
+  </section>
+  <aside>
+    <div class="card">
+      <h2>🧍 Detected persons (<span id="pCount">0</span>)</h2>
+      <div id="personList"><span style="opacity:.5">No persons yet.</span></div>
+    </div>
+    <div class="card">
+      <h2 class="orange">📦 Other objects (<span id="oCount">0</span>)</h2>
+      <div id="objectList"><span style="opacity:.5">No objects yet.</span></div>
+    </div>
+    <div class="card">
+      <h2>📏 How speed is measured</h2>
+      <p id="note">
+        Each person is tracked by the center of their box across frames.<br>
+        <b>px/s</b> = pixels moved per second.<br>
+        <b>km/h</b> ≈ estimated using box height as ~1.7&nbsp;m reference — rough, not a calibrated measurement.
+        Speeds smooth over ~0.5&nbsp;s to reduce jitter.
+      </p>
+    </div>
+  </aside>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.17.0/dist/tf.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.3/dist/coco-ssd.min.js"></script>
+<script>
+const video = document.getElementById('cam');
+const canvas = document.getElementById('overlay');
+const ctx = canvas.getContext('2d');
+const startBtn = document.getElementById('startBtn');
+const stopBtn = document.getElementById('stopBtn');
+const statusEl = document.getElementById('status');
+const errEl = document.getElementById('err');
+const personList = document.getElementById('personList');
+const objectList = document.getElementById('objectList');
+const pCount = document.getElementById('pCount');
+const oCount = document.getElementById('oCount');
+
+let model = null, stream = null, running = false, rafId = null, lastDetect = 0;
+let tracks = []; // {id, cx, cy, t, speeds:[], bbox, score, label, missing}
+let nextId = 1;
+
+function fitCanvas(){
+  const r = video.getBoundingClientRect();
+  // use video intrinsic size for coordinate mapping
+  canvas.width = video.videoWidth || 640;
+  canvas.height = video.videoHeight || 480;
+}
+function toCanvas(x, y, w, h){
+  const sx = canvas.width / (video.videoWidth || 640);
+  const sy = canvas.height / (video.videoHeight || 480);
+  return [x*sx, y*sy, w*sx, h*sy];
+}
+
+async function loadModel(){
+  statusEl.textContent = 'Loading detection model…';
+  try {
+    model = await cocoSsd.load();
+    statusEl.textContent = 'Model ready. Click Start.';
+  } catch(e){
+    errEl.textContent = 'Failed to load model: ' + e.message;
+    statusEl.textContent = 'Model failed to load.';
+  }
+}
+
+async function start(){
+  errEl.textContent = '';
+  if(!model){ await loadModel(); if(!model) return; }
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ video:{ width:{ideal:1280}, height:{ideal:720}, facingMode:'user' }, audio:false });
+  } catch(e){
+    errEl.textContent = 'Camera error: ' + e.message + ' — allow camera access and use HTTPS or localhost.';
+    return;
+  }
+  video.srcObject = stream;
+  await video.play().catch(()=>{});
+  fitCanvas();
+  running = true;
+  startBtn.disabled = true; stopBtn.disabled = false;
+  statusEl.textContent = 'Detecting…';
+  detectLoop();
+}
+
+function stop(){
+  running = false;
+  cancelAnimationFrame(rafId);
+  if(stream){ stream.getTracks().forEach(t=>t.stop()); stream = null; }
+  video.srcObject = null;
+  tracks = [];
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  renderLists([], []);
+  startBtn.disabled = false; stopBtn.disabled = true;
+  statusEl.textContent = 'Stopped.';
+}
+
+function matchTracks(detections, now){
+  // detections: [{bbox:[x,y,w,h], class, score, cx, cy}]
+  const used = new Set();
+  for(const d of detections){
+    let best=null, bd=1e9;
+    for(const tr of tracks){
+      if(used.has(tr.id)) continue;
+      if(tr.label !== d.class) continue;
+      const dist = Math.hypot(tr.cx-d.cx, tr.cy-d.cy);
+      if(dist < bd && dist < 120){ bd=dist; best=tr; }
+    }
+    if(best){
+      used.add(best.id);
+      const dt = Math.max(0.05,(now-best.t)/1000);
+      const px = Math.hypot(d.cx-best.cx, d.cy-best.cy);
+      const inst = px/dt; // px/s
+      best.speeds.push(inst); if(best.speeds.length>8) best.speeds.shift();
+      best.cx=d.cx; best.cy=d.cy; best.t=now; best.bbox=d.bbox; best.score=d.score; best.missing=0;
+    } else {
+      const tr={ id:nextId++, cx:d.cx, cy:d.cy, t:now, speeds:[], bbox:d.bbox, score:d.score, label:d.class, missing:0 };
+      tracks.push(tr); used.add(tr.id);
+    }
+  }
+  // age out missing tracks
+  for(const tr of tracks){ if(!used.has(tr.id)) tr.missing++; }
+  tracks = tracks.filter(tr=>tr.missing<10);
+}
+
+function avgSpeed(tr){
+  if(!tr.speeds.length) return 0;
+  return tr.speeds.reduce((a,b)=>a+b,0)/tr.speeds.length;
+}
+function estKmh(tr){
+  const pxs = avgSpeed(tr);
+  const h = tr.bbox[3] || 200; // bbox height px
+  const mPerPx = 1.7 / Math.max(40,h);
+  return pxs * mPerPx * 3.6;
+}
+
+function renderLists(persons, objects){
+  pCount.textContent = persons.length;
+  oCount.textContent = objects.length;
+  personList.innerHTML = persons.length ? persons.map(tr=>{
+    const kmh = estKmh(tr).toFixed(1), pxs = avgSpeed(tr).toFixed(0);
+    return `<div class="row"><span class="pill human">PERSON #${tr.id}</span> conf ${(tr.score*100).toFixed(0)}%<br><span class="speed">${pxs} px/s ≈ ${kmh} km/h</span></div>`;
+  }).join('') : '<span style="opacity:.5">No persons yet.</span>';
+  objectList.innerHTML = objects.length ? objects.map(o=>
+    `<div class="row"><span class="pill object">${o.class.toUpperCase()}</span> conf ${(o.score*100).toFixed(0)}% — not a person</div>`
+  ).join('') : '<span style="opacity:.5">No objects yet.</span>';
+}
+
+async function detectLoop(){
+  if(!running) return;
+  const now = performance.now();
+  if(now - lastDetect > 180 && video.videoWidth){
+    lastDetect = now;
+    try {
+      const preds = await model.detect(video);
+      const dets = preds.map(p=>{
+        const [x,y,w,h]=p.bbox;
+        return { bbox:p.bbox, class:p.class, score:p.score, cx:x+w/2, cy:y+h/2 };
+      });
+      matchTracks(dets, now);
+      draw(dets);
+      renderLists(tracks.filter(t=>t.label==='person'), dets.filter(d=>d.class!=='person'));
+      statusEl.textContent = `Detecting… ${dets.filter(d=>d.class==='person').length} person(s), ${dets.filter(d=>d.class!=='person').length} object(s)`;
+    } catch(e){ /* keep looping */ }
+  }
+  rafId = requestAnimationFrame(detectLoop);
+}
+
+function draw(dets){
+  ctx.clearRect(0,0,canvas.width,canvas.height);
+  const sx = canvas.width/(video.videoWidth||640), sy = canvas.height/(video.videoHeight||480);
+  for(const d of dets){
+    const isPerson = d.class==='person';
+    const [x,y,w,h] = [d.bbox[0]*sx, d.bbox[1]*sy, d.bbox[2]*sx, d.bbox[3]*sy];
+    ctx.strokeStyle = isPerson ? '#7CFC00' : '#ff9f1c';
+    ctx.lineWidth = 3;
+    ctx.strokeRect(x,y,w,h);
+    const tr = tracks.find(t=>t.label===d.class && Math.hypot(t.cx-d.cx,t.cy-d.cy)<120);
+    let label = isPerson ? `PERSON${tr? ' #'+tr.id:''} ${(d.score*100)|0}%` : `${d.class} ${(d.score*100)|0}%`;
+    if(isPerson && tr){ label += ` ${avgSpeed(tr).toFixed(0)}px/s`; }
+    ctx.font = '14px sans-serif';
+    const tw = ctx.measureText(label).width;
+    ctx.fillStyle = isPerson ? '#7CFC00' : '#ff9f1c';
+    ctx.fillRect(x, y-22, tw+12, 22);
+    ctx.fillStyle = '#0b0e1a';
+    ctx.fillText(label, x+6, y-6);
+  }
+}
+
+startBtn.addEventListener('click', start);
+stopBtn.addEventListener('click', stop);
+video.addEventListener('loadedmetadata', fitCanvas);
+loadModel();
+</script>
+</body>
+</html>
