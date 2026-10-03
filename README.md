@@ -22,6 +22,7 @@ Just open `index.html` in a modern browser (Chrome/Edge recommended), or host vi
 
 - **Start camera & detection** — begins webcam + AI loop
 - **Stop** — stops camera and clears tracks
+- **🎚 Object sensitivity slider** — lower it if objects aren't being detected (more detections, may include false positives); raise it if you see wrong labels
 
 ## Human vs object — how it tells the difference
 
